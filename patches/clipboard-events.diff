@@ -49,6 +49,22 @@ Index: code-server/lib/vscode/src/vscode-dts/vscode.d.ts
  	 * An event that is fired when files are going to be created.
  	 *
  	 * To make modifications to the workspace before the files are created,
+@@ -14151,6 +14191,15 @@ declare module 'vscode' {
+ 		export function registerTextDocumentContentProvider(scheme: string, provider: TextDocumentContentProvider): Disposable;
+ 
+ 		/**
++		 * An event that is emitted when text is copied to the clipboard.
++		 */
++		export const onDidAcceptCopy: Event<CopyEvent>;
++		/**
++		 * An event that is emitted when text is pasted from the clipboard.
++		 */
++		export const onDidAcceptPaste: Event<string>;
++
++		/**
+ 		 * An event that is emitted when a {@link TextDocument text document} is opened or when the language id
+ 		 * of a text document {@link languages.setTextDocumentLanguage has been changed}.
+ 		 *
 Index: code-server/lib/vscode/src/vs/editor/contrib/dropOrPasteInto/browser/copyPasteController.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/editor/contrib/dropOrPasteInto/browser/copyPasteController.ts
@@ -208,13 +224,52 @@ Index: code-server/lib/vscode/src/vs/workbench/api/common/extHost.api.impl.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/api/common/extHost.api.impl.ts
 +++ code-server/lib/vscode/src/vs/workbench/api/common/extHost.api.impl.ts
-@@ -1945,4 +1945,4 @@ export function createApiFactoryAndRegis
- 			SettingsSearchResultKind: extHostTypes.SettingsSearchResultKind
- 		};
- 	};
--}
-+}
-\ No newline at end of file
+@@ -39,7 +39,7 @@ import { ExtHostChatAgents2 } from './ex
+ import { ExtHostChatOutputRenderer } from './extHostChatOutputRenderer.js';
+ import { ExtHostChatSessions } from './extHostChatSessions.js';
+ import { ExtHostChatStatus } from './extHostChatStatus.js';
+-import { ExtHostClipboard } from './extHostClipboard.js';
++import { IExtHostClipboard } from './extHostClipboard.js';
+ import { ExtHostEditorInsets } from './extHostCodeInsets.js';
+ import { ExtHostCodeMapper } from './extHostCodeMapper.js';
+ import { IExtHostCommands } from './extHostCommands.js';
+@@ -180,6 +180,7 @@ export function createApiFactoryAndRegis
+ 	// automatically create and register addressable instances
+ 	const extHostDecorations = rpcProtocol.set(ExtHostContext.ExtHostDecorations, accessor.get(IExtHostDecorations));
+ 	const extHostDocumentsAndEditors = rpcProtocol.set(ExtHostContext.ExtHostDocumentsAndEditors, accessor.get(IExtHostDocumentsAndEditors));
++	const extHostClipboard = rpcProtocol.set(ExtHostContext.ExtHostClipboard, accessor.get(IExtHostClipboard));
+ 	const extHostCommands = rpcProtocol.set(ExtHostContext.ExtHostCommands, accessor.get(IExtHostCommands));
+ 	const extHostTerminalService = rpcProtocol.set(ExtHostContext.ExtHostTerminalService, accessor.get(IExtHostTerminalService));
+ 	const extHostTerminalShellIntegration = rpcProtocol.set(ExtHostContext.ExtHostTerminalShellIntegration, accessor.get(IExtHostTerminalShellIntegration));
+@@ -244,7 +245,6 @@ export function createApiFactoryAndRegis
+ 
+ 	// Other instances
+ 	const extHostBulkEdits = new ExtHostBulkEdits(rpcProtocol, extHostDocumentsAndEditors);
+-	const extHostClipboard = new ExtHostClipboard(rpcProtocol);
+ 	const extHostMessageService = new ExtHostMessageService(rpcProtocol, extHostLogService);
+ 	const extHostDialogs = new ExtHostDialogs(rpcProtocol);
+ 	const extHostChatStatus = new ExtHostChatStatus(rpcProtocol);
+@@ -880,7 +880,6 @@ export function createApiFactoryAndRegis
+ 				return extHostTerminalService.registerProfileProvider(extension, id, provider);
+ 			},
+ 			registerTerminalCompletionProvider(provider: vscode.TerminalCompletionProvider<vscode.TerminalCompletionItem>, ...triggerCharacters: string[]): vscode.Disposable {
+-				checkProposedApiEnabled(extension, 'terminalCompletionProvider');
+ 				return extHostTerminalService.registerTerminalCompletionProvider(extension, provider, ...triggerCharacters);
+ 			},
+ 			registerTerminalQuickFixProvider(id: string, provider: vscode.TerminalQuickFixProvider): vscode.Disposable {
+@@ -1094,6 +1093,12 @@ export function createApiFactoryAndRegis
+ 					});
+ 				});
+ 			},
++			onDidAcceptCopy: (listener, thisArgs?, disposables?) => {
++				return _asExtensionEvent(extHostClipboard.onDidAcceptCopy)(listener, thisArgs, disposables);
++			},
++			onDidAcceptPaste: (listener, thisArgs?, disposables?) => {
++				return _asExtensionEvent(extHostClipboard.onDidAcceptPaste)(listener, thisArgs, disposables);
++			},
+ 			onDidOpenTextDocument: (listener, thisArgs?, disposables?) => {
+ 				return _asExtensionEvent(extHostDocuments.onDidAddDocument)(listener, thisArgs, disposables);
+ 			},
 Index: code-server/lib/vscode/src/vs/workbench/api/common/extHost.common.services.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/api/common/extHost.common.services.ts
@@ -379,3 +434,38 @@ Index: code-server/lib/vscode/src/vs/workbench/services/clipboard/electron-brows
  	async triggerPaste(targetWindowId: number): Promise<void> {
  		this.logService.trace('NativeClipboardService#triggerPaste called');
  		return this.nativeHostService.triggerPaste({ targetWindowId });
+Index: code-server/lib/vscode/src/vs/workbench/api/browser/mainThreadClipboard.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/api/browser/mainThreadClipboard.ts
++++ code-server/lib/vscode/src/vs/workbench/api/browser/mainThreadClipboard.ts
+@@ -4,18 +4,28 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import { extHostNamedCustomer, IExtHostContext } from '../../services/extensions/common/extHostCustomers.js';
+-import { MainContext, MainThreadClipboardShape } from '../common/extHost.protocol.js';
++import { MainContext, MainThreadClipboardShape, ExtHostContext, ExtHostClipboardShape } from '../common/extHost.protocol.js';
+ import { IClipboardService } from '../../../platform/clipboard/common/clipboardService.js';
+ import { ILogService } from '../../../platform/log/common/log.js';
+ 
+ @extHostNamedCustomer(MainContext.MainThreadClipboard)
+ export class MainThreadClipboard implements MainThreadClipboardShape {
+ 
++	private readonly _proxy: ExtHostClipboardShape;
++
+ 	constructor(
+ 		_context: IExtHostContext,
+ 		@IClipboardService private readonly _clipboardService: IClipboardService,
+ 		@ILogService private readonly _logService: ILogService
+-	) { }
++	) {
++		this._proxy = _context.getProxy(ExtHostContext.ExtHostClipboard);
++		this._clipboardService.onDidAcceptCopy?.(event => {
++			this._proxy.$acceptCopy(event);
++		});
++		this._clipboardService.onDidAcceptPaste?.(event => {
++			this._proxy.$acceptPaste(event);
++		});
++	}
+ 
+ 	dispose(): void {
+ 		// nothing
