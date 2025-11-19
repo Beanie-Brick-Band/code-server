@@ -1,0 +1,381 @@
+Index: code-server/lib/vscode/src/vscode-dts/vscode.d.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vscode-dts/vscode.d.ts
++++ code-server/lib/vscode/src/vscode-dts/vscode.d.ts
+@@ -13434,6 +13434,46 @@ declare module 'vscode' {
+ 	}
+ 
+ 	/**
++	 * An event that is fired when a copy is detected
++	 */
++	export interface CopyEvent {
++		/**
++		 * The file that was copied
++		 */
++		uri: Uri;
++
++		/**
++		 * Contents of the copy
++		 */
++		contents: {
++			/**
++			 * The text that was copied
++			 */
++			plainText: string;
++
++			/**
++			 * The start of the user's selection at time of the copy
++			*/
++			// start: Position;
++
++			// /**
++			//  * The end of the user's selection at time of the copy
++			// */
++			// end: Position;
++
++			// /**
++			//  * The anchor of the user's selection at time of the copy
++			// */
++			// anchor: Position;
++
++			// /**
++			//  * The cursor position at hte time of the copy
++			// */
++			// active: Position;
++		}[];
++	}
++
++	/**
+ 	 * An event that is fired when files are going to be created.
+ 	 *
+ 	 * To make modifications to the workspace before the files are created,
+Index: code-server/lib/vscode/src/vs/editor/contrib/dropOrPasteInto/browser/copyPasteController.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/editor/contrib/dropOrPasteInto/browser/copyPasteController.ts
++++ code-server/lib/vscode/src/vs/editor/contrib/dropOrPasteInto/browser/copyPasteController.ts
+@@ -224,8 +224,21 @@ export class CopyPasteController extends
+ 		const providers = this._languageFeaturesService.documentPasteEditProvider
+ 			.ordered(model)
+ 			.filter(x => !!x.prepareDocumentPaste);
++
++		const multiCursorTextOrSingleText = Array.isArray(toCopy) ? toCopy : toCopy ? [toCopy] : [];
++		const clipboardServiceContents = multiCursorTextOrSingleText.length === selections.length
++			? multiCursorTextOrSingleText.map((plainText, i) => ({
++				plainText,
++				start: { line: selections[i].startLineNumber, character: selections[i].startColumn },
++				end: { line: selections[i].endLineNumber, character: selections[i].endColumn },
++				anchor: { line: selections[i].selectionStartLineNumber, character: selections[i].selectionStartColumn },
++				active: { line: selections[i].positionLineNumber, character: selections[i].positionColumn }
++			}))
++			: [];
+ 		if (!providers.length) {
++			// Zip multicursorText and selections together to form contents array
+ 			this.setCopyMetadata(e.clipboardData, { defaultPastePayload });
++			this._clipboardService.acceptCopy({ uri: model.uri, type: 'copy', contents: clipboardServiceContents });
+ 			return;
+ 		}
+ 
+@@ -239,6 +252,7 @@ export class CopyPasteController extends
+ 			providerCopyMimeTypes,
+ 			defaultPastePayload
+ 		});
++		this._clipboardService.acceptCopy({ uri: model.uri, type: 'copy', contents: clipboardServiceContents });
+ 
+ 		const operations = providers.map((provider): CopyOperation => {
+ 			return {
+Index: code-server/lib/vscode/src/vs/platform/clipboard/browser/clipboardService.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/platform/clipboard/browser/clipboardService.ts
++++ code-server/lib/vscode/src/vs/platform/clipboard/browser/clipboardService.ts
+@@ -7,11 +7,11 @@ import { isSafari, isWebkitWebView } fro
+ import { $, addDisposableListener, getActiveDocument, getActiveWindow, isHTMLElement, onDidRegisterWindow } from '../../../base/browser/dom.js';
+ import { mainWindow } from '../../../base/browser/window.js';
+ import { DeferredPromise } from '../../../base/common/async.js';
+-import { Event } from '../../../base/common/event.js';
++import { Emitter, Event } from '../../../base/common/event.js';
+ import { hash } from '../../../base/common/hash.js';
+ import { Disposable } from '../../../base/common/lifecycle.js';
+ import { URI } from '../../../base/common/uri.js';
+-import { IClipboardService } from '../common/clipboardService.js';
++import { IClipboardEvent, IClipboardService } from '../common/clipboardService.js';
+ import { ILayoutService } from '../../layout/browser/layoutService.js';
+ import { ILogService } from '../../log/common/log.js';
+ 
+@@ -26,6 +26,12 @@ export class BrowserClipboardService ext
+ 
+ 	declare readonly _serviceBrand: undefined;
+ 
++	private readonly _onDidAcceptCopy = new Emitter<IClipboardEvent<'copy'>>();
++	private readonly _onDidAcceptPaste = new Emitter<string>();
++
++	readonly onDidAcceptCopy: Event<IClipboardEvent<'copy'>> = this._onDidAcceptCopy.event;
++	readonly onDidAcceptPaste: Event<string> = this._onDidAcceptPaste.event;
++
+ 	constructor(
+ 		@ILayoutService private readonly layoutService: ILayoutService,
+ 		@ILogService protected readonly logService: ILogService
+@@ -45,6 +51,10 @@ export class BrowserClipboardService ext
+ 		}, { window: mainWindow, disposables: this._store }));
+ 	}
+ 
++	acceptCopy(event: IClipboardEvent<'copy'>): void {
++		this._onDidAcceptCopy.fire(event);
++	}
++
+ 	triggerPaste(): Promise<void> | undefined {
+ 		this.logService.trace('BrowserClipboardService#triggerPaste');
+ 		return undefined;
+Index: code-server/lib/vscode/src/vs/platform/clipboard/common/clipboardService.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/platform/clipboard/common/clipboardService.ts
++++ code-server/lib/vscode/src/vs/platform/clipboard/common/clipboardService.ts
+@@ -3,18 +3,37 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
++import { Event } from '../../../base/common/event.js';
+ import { URI } from '../../../base/common/uri.js';
++import { Position } from '../../../base/common/yaml.js';
+ import { createDecorator } from '../../instantiation/common/instantiation.js';
+ 
+ export const IClipboardService = createDecorator<IClipboardService>('clipboardService');
+ 
++export interface IClipboardEvent<T extends 'copy' | 'paste'> {
++	uri: URI;
++	type: T;
++	contents: {
++		plainText: string;
++		start: Position;
++		end: Position;
++		anchor: Position;
++		active: Position;
++	}[];
++}
++
+ export interface IClipboardService {
+ 
+ 	readonly _serviceBrand: undefined;
+ 
++	readonly onDidAcceptCopy: Event<IClipboardEvent<'copy'>>;
++	readonly onDidAcceptPaste: Event<string>;
++
++	acceptCopy(event: IClipboardEvent<'copy'>): void;
++
+ 	/**
+ 	 * Trigger the paste. Returns undefined if the paste was not triggered or a promise that resolves on paste end.
+-	 */
++	*/
+ 	triggerPaste(targetWindowId: number): Promise<void> | undefined;
+ 
+ 	/**
+Index: code-server/lib/vscode/src/vs/platform/clipboard/test/common/testClipboardService.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/platform/clipboard/test/common/testClipboardService.ts
++++ code-server/lib/vscode/src/vs/platform/clipboard/test/common/testClipboardService.ts
+@@ -3,10 +3,19 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
++import { Emitter, Event } from '../../../../base/common/event.js';
+ import { URI } from '../../../../base/common/uri.js';
+-import { IClipboardService } from '../../common/clipboardService.js';
++import { IClipboardEvent, IClipboardService } from '../../common/clipboardService.js';
+ 
+ export class TestClipboardService implements IClipboardService {
++
++	private readonly _onDidAcceptCopy = new Emitter<IClipboardEvent<'copy'>>();
++	private readonly _onDidAcceptPaste = new Emitter<string>();
++
++	readonly onDidAcceptCopy: Event<IClipboardEvent<'copy'>> = this._onDidAcceptCopy.event;
++	readonly onDidAcceptPaste: Event<string> = this._onDidAcceptPaste.event;
++
++
+ 	readImage(): Promise<Uint8Array> {
+ 		throw new Error('Method not implemented.');
+ 	}
+@@ -15,6 +24,10 @@ export class TestClipboardService implem
+ 
+ 	private text: string | undefined = undefined;
+ 
++	acceptCopy(event: IClipboardEvent<'copy'>): void {
++		this._onDidAcceptCopy.fire(event);
++	}
++
+ 	triggerPaste(): Promise<void> | undefined {
+ 		return Promise.resolve();
+ 	}
+Index: code-server/lib/vscode/src/vs/workbench/api/common/extHost.api.impl.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/api/common/extHost.api.impl.ts
++++ code-server/lib/vscode/src/vs/workbench/api/common/extHost.api.impl.ts
+@@ -1945,4 +1945,4 @@ export function createApiFactoryAndRegis
+ 			SettingsSearchResultKind: extHostTypes.SettingsSearchResultKind
+ 		};
+ 	};
+-}
++}
+\ No newline at end of file
+Index: code-server/lib/vscode/src/vs/workbench/api/common/extHost.common.services.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/api/common/extHost.common.services.ts
++++ code-server/lib/vscode/src/vs/workbench/api/common/extHost.common.services.ts
+@@ -34,10 +34,12 @@ import { ExtHostMcpService, IExtHostMpcS
+ import { ExtHostUrls, IExtHostUrlsService } from './extHostUrls.js';
+ import { ExtHostProgress, IExtHostProgress } from './extHostProgress.js';
+ import { ExtHostDataChannels, IExtHostDataChannels } from './extHostDataChannels.js';
++import { ExtHostClipboard, IExtHostClipboard } from './extHostClipboard.js';
+ 
+ registerSingleton(IExtHostLocalizationService, ExtHostLocalizationService, InstantiationType.Delayed);
+ registerSingleton(ILoggerService, ExtHostLoggerService, InstantiationType.Delayed);
+ registerSingleton(IExtHostApiDeprecationService, ExtHostApiDeprecationService, InstantiationType.Delayed);
++registerSingleton(IExtHostClipboard, ExtHostClipboard, InstantiationType.Delayed);
+ registerSingleton(IExtHostCommands, ExtHostCommands, InstantiationType.Eager);
+ registerSingleton(IExtHostProgress, ExtHostProgress, InstantiationType.Eager);
+ registerSingleton(IExtHostLanguageModels, ExtHostLanguageModels, InstantiationType.Eager);
+Index: code-server/lib/vscode/src/vs/workbench/api/common/extHost.protocol.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/api/common/extHost.protocol.ts
++++ code-server/lib/vscode/src/vs/workbench/api/common/extHost.protocol.ts
+@@ -98,6 +98,7 @@ import { ISaveProfileResult } from '../.
+ import { IExtHostDocumentSaveDelegate } from './extHostDocumentData.js';
+ import { TerminalShellExecutionCommandLineConfidence } from './extHostTypes.js';
+ import * as tasks from './shared/tasks.js';
++import type { IClipboardEvent } from '../../../platform/clipboard/common/clipboardService.js';
+ 
+ export type IconPathDto =
+ 	| UriComponents
+@@ -1872,6 +1873,11 @@ export interface ExtHostCodeMapperShape
+ 	$mapCode(handle: number, request: ICodeMapperRequestDto, token: CancellationToken): Promise<ICodeMapperResult | null | undefined>;
+ }
+ 
++export interface ExtHostClipboardShape {
++	$acceptCopy(value: IClipboardEvent<'copy'>): void;
++	$acceptPaste(value: string): void;
++}
++
+ export interface ExtHostCommandsShape {
+ 	$executeContributedCommand(id: string, ...args: any[]): Promise<unknown>;
+ 	$getContributedCommandMetadata(): Promise<{ [id: string]: string | ICommandMetadataDto }>;
+@@ -3346,6 +3352,7 @@ export const MainContext = {
+ 
+ export const ExtHostContext = {
+ 	ExtHostCodeMapper: createProxyIdentifier<ExtHostCodeMapperShape>('ExtHostCodeMapper'),
++	ExtHostClipboard: createProxyIdentifier<ExtHostClipboardShape>('ExtHostClipboard'),
+ 	ExtHostCommands: createProxyIdentifier<ExtHostCommandsShape>('ExtHostCommands'),
+ 	ExtHostConfiguration: createProxyIdentifier<ExtHostConfigurationShape>('ExtHostConfiguration'),
+ 	ExtHostDiagnostics: createProxyIdentifier<ExtHostDiagnosticsShape>('ExtHostDiagnostics'),
+Index: code-server/lib/vscode/src/vs/workbench/api/common/extHostClipboard.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/api/common/extHostClipboard.ts
++++ code-server/lib/vscode/src/vs/workbench/api/common/extHostClipboard.ts
+@@ -3,22 +3,58 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
+-import { IMainContext, MainContext } from './extHost.protocol.js';
++import { Emitter, Event } from '../../../base/common/event.js';
++import { createDecorator } from '../../../platform/instantiation/common/instantiation.js';
++import { ExtHostClipboardShape, MainContext } from './extHost.protocol.js';
+ import type * as vscode from 'vscode';
++import { IExtHostRpcService } from './extHostRpcService.js';
++import { IClipboardEvent } from '../../../platform/clipboard/common/clipboardService.js';
+ 
+-export class ExtHostClipboard {
++export class ExtHostClipboard implements ExtHostClipboardShape {
++
++	readonly _serviceBrand: undefined;
+ 
+ 	readonly value: vscode.Clipboard;
+ 
+-	constructor(mainContext: IMainContext) {
+-		const proxy = mainContext.getProxy(MainContext.MainThreadClipboard);
++	private readonly _onDidAcceptCopy = new Emitter<vscode.CopyEvent>();
++	private readonly _onDidAcceptPaste = new Emitter<string>();
++
++	readonly onDidAcceptCopy: Event<vscode.CopyEvent> = this._onDidAcceptCopy.event;
++	readonly onDidAcceptPaste: Event<string> = this._onDidAcceptPaste.event;
++
++	constructor(@IExtHostRpcService extHostRpc: IExtHostRpcService) {
++		const proxy = extHostRpc.getProxy(MainContext.MainThreadClipboard);
++		const readText = async () => {
++			const text = await proxy.$readText();
++			// don't need because parent would be listening to them anyways
++			// this._onDidPaste.fire(text);
++			return text;
++		};
++		const writeText = async (value: string) => {
++			// this._onDidAcceptCopy.fire(value);
++			await proxy.$writeText(value);
++		};
+ 		this.value = Object.freeze({
+-			readText() {
+-				return proxy.$readText();
+-			},
+-			writeText(value: string) {
+-				return proxy.$writeText(value);
+-			}
++			readText,
++			writeText,
+ 		});
+ 	}
++
++	$acceptCopy(value: IClipboardEvent<'copy'>): void {
++		console.debug('acceptCopy', value);
++		this._onDidAcceptCopy.fire({
++			uri: value.uri,
++			contents: value.contents.map(content => ({
++				plainText: content.plainText,
++			}))
++		});
++	}
++
++	$acceptPaste(value: string): void {
++		console.debug('acceptPaste', value);
++		this._onDidAcceptPaste.fire(value);
++	}
+ }
++
++export interface IExtHostClipboard extends ExtHostClipboard { }
++export const IExtHostClipboard = createDecorator<IExtHostClipboard>('IExtHostClipboard');
+Index: code-server/lib/vscode/src/vs/workbench/services/clipboard/electron-browser/clipboardService.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/services/clipboard/electron-browser/clipboardService.ts
++++ code-server/lib/vscode/src/vs/workbench/services/clipboard/electron-browser/clipboardService.ts
+@@ -3,13 +3,14 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
+-import { IClipboardService } from '../../../../platform/clipboard/common/clipboardService.js';
++import { IClipboardEvent, IClipboardService } from '../../../../platform/clipboard/common/clipboardService.js';
+ import { URI } from '../../../../base/common/uri.js';
+ import { isMacintosh } from '../../../../base/common/platform.js';
+ import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
+ import { INativeHostService } from '../../../../platform/native/common/native.js';
+ import { VSBuffer } from '../../../../base/common/buffer.js';
+ import { ILogService } from '../../../../platform/log/common/log.js';
++import { Emitter, Event } from '../../../../base/common/event.js';
+ 
+ export class NativeClipboardService implements IClipboardService {
+ 
+@@ -17,11 +18,21 @@ export class NativeClipboardService impl
+ 
+ 	declare readonly _serviceBrand: undefined;
+ 
++	private readonly _onDidAcceptCopy = new Emitter<IClipboardEvent<'copy'>>();
++	private readonly _onDidAcceptPaste = new Emitter<string>();
++
++	readonly onDidAcceptCopy: Event<IClipboardEvent<'copy'>> = this._onDidAcceptCopy.event;
++	readonly onDidAcceptPaste: Event<string> = this._onDidAcceptPaste.event;
++
+ 	constructor(
+ 		@INativeHostService private readonly nativeHostService: INativeHostService,
+ 		@ILogService private readonly logService: ILogService
+ 	) { }
+ 
++	acceptCopy(event: IClipboardEvent<'copy'>): void {
++		this._onDidAcceptCopy.fire(event);
++	}
++
+ 	async triggerPaste(targetWindowId: number): Promise<void> {
+ 		this.logService.trace('NativeClipboardService#triggerPaste called');
+ 		return this.nativeHostService.triggerPaste({ targetWindowId });
